@@ -44,11 +44,82 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from ravens import Dataset, Environment, agents, tasks
 
+from diffusion_policy.network import ConditionalUnet1D
+from diffusion_policy.vision_encoder import *
+from diffusion_policy.dataset import *
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.training_utils import EMAModel
+from diffusers.optimization import get_scheduler
+import torch
+
 # Of critical importance! Do 2 for max of 100 demos, 3 for max of 1000 demos.
 MAX_ORDER = 3
 
+def diffusion_inference(obs, stats, obs_horizon=1, action_horizon=1):
+    """
+    Make a prediction of action based on the observation using a model trained by Diffusion Policy.
+    obs: list of 480*640*3
+    """
+    # device transfer
+    cond_image = torch.Tensor(obs)
+    cond_image = cond_image.permute(2, 0, 1).unsqueeze(0) # [1, 3, 480, 640]
+    # cond_image = f(obs)
+    nimages = cond_image.to(device, dtype=torch.float32)
 
-def rollout(agent, env, tasks, args):
+    # infer action
+    with torch.no_grad():
+        # get image features
+        image_features = ema_nets['vision_encoder'](nimages)
+
+        # concat with low-dim observations
+        obs_features = image_features
+
+        # reshape observation to (B,obs_horizon*obs_dim)
+        obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)
+
+        # initialize action from Guassian noise
+        pred_horizon = 1
+        action_dim = 4
+        noisy_action = torch.randn(
+            (1, pred_horizon, action_dim), device=device)
+        naction = noisy_action
+
+        # init scheduler
+        noise_scheduler.set_timesteps(num_diffusion_iters)
+
+        for k in noise_scheduler.timesteps:
+            # predict noise
+            noise_pred = ema_nets['noise_pred_net'](
+                sample=naction,
+                timestep=k,
+                global_cond=obs_cond
+            )
+
+            # inverse diffusion step (remove noise)
+            naction = noise_scheduler.step(
+                model_output=noise_pred,
+                timestep=k,
+                sample=naction
+            ).prev_sample
+
+    # unnormalize action
+    naction = naction.detach().to('cpu').numpy()
+    # (B, pred_horizon, action_dim)
+    naction = naction[0]
+    action_pred = unnormalize_data(naction, stats=stats['action'])
+
+    # only take action_horizon number of actions
+    start = obs_horizon - 1
+    end = start + action_horizon
+    action = action_pred[start:end,:].flatten() # numpy, (4,)
+    ori = (0.0, 0.0, 0.0, 1.0) # quaternion of the grasp
+    z_val = 0.14
+    pose0 = (np.append(action[:2], z_val), ori) # pick
+    pose1 = (np.append(action[2:], z_val), ori) # place
+
+    return pose0, pose1
+    
+def rollout(agent, env, stats, args):
     """Standard gym environment rollout. A few clarifications:
 
     (1) Originally, we did not append the LAST observation and info, since it
@@ -108,13 +179,19 @@ def rollout(agent, env, tasks, args):
     obs = env.reset(task)
     info = env.info
     for t in range(start_t, task.max_steps):
+        # print("!!!!!obs ", len(obs['color'][0])) if len(list(obs.keys()))>=2 else None # ['color', 'depth'], obs['color'][0]: list of 480*640*3
         act = agent.act(obs, info)
+        if len(list(obs.keys()))>=2: # take the act only in the first empty loop
+            obs_rgb = obs['color'][0]
+            pose0, pose1 = diffusion_inference(obs_rgb, stats)
+            act['params']['pose0'] = pose0
+            act['params']['pose1'] = pose1
+
         if len(obs) > 0 and act['primitive']:
             episode.append((obs, act, info))
         (obs, reward, done, info) = env.step(act)
         total_reward += reward
         last_obs_info = (obs, info)
-        #print(info['extras'], info['...']) # Use this to debug if needed.
         if done:
             break
     return total_reward, episode, t, last_obs_info
@@ -193,6 +270,41 @@ def ignore_this_demo(args, demo_reward, t, last_extras):
 
     return ignore
 
+def get_network():
+    # **Network Demo**
+    obs_horizon = 1
+
+    # construct ResNet18 encoder
+    # if you have multiple camera views, use seperate encoder weights for each view.
+    vision_encoder = get_resnet('resnet18')
+
+    # IMPORTANT!
+    # replace all BatchNorm with GroupNorm to work with EMA
+    # performance will tank if you forget to do this!
+    vision_encoder = replace_bn_with_gn(vision_encoder)
+
+    # ResNet18 has output dim of 512
+    vision_feature_dim = 512
+    # agent_pos is 2 dimensional
+    # lowdim_obs_dim =2
+    lowdim_obs_dim = 0
+    # observation feature has 514 dims in total per step
+    obs_dim = vision_feature_dim + lowdim_obs_dim
+    action_dim = 4
+
+    # create network object
+    noise_pred_net = ConditionalUnet1D(
+        input_dim=action_dim,
+        global_cond_dim=obs_dim*obs_horizon
+    )
+
+    # the final arch has 2 parts
+    nets = nn.ModuleDict({
+        'vision_encoder': vision_encoder,
+        'noise_pred_net': noise_pred_net
+    })
+
+    return nets
 
 if __name__ == '__main__':
     # Parse command line arguments.
@@ -231,43 +343,21 @@ if __name__ == '__main__':
     if args.subsamp_g:
         dataset.subsample_goals = True
 
-    # Collect training data from oracle demonstrations.
-    max_demos = 10**MAX_ORDER
-    task.mode = 'train'
-    seed_to_add = 0  # Daniel: check carefully if resuming the bag-items tasks.
+    # Loading Pretrained Checkpoint
+    # Set `load_pretrained = True` to load pretrained weights.
+    load_pretrained = 1
+    if load_pretrained:
+        ckpt_path = "/home/yif/Documents/KTH/git/DeformableDiffusion/sf24.ckpt"
+        if not os.path.isfile(ckpt_path):
+            print('Path not found!')
 
-    # If continuing from prior calls, the demo index starts counting based on
-    # the number of demos that exist in `data/{task}`. Make the environment
-    # here, to issues with cloth rendering + multiple Environment calls.
-    make_new_env = (dataset.num_episodes < max_demos)
-    if make_new_env:
-        env = Environment(args.disp, hz=args.hz)
-
-    # YD: creating a dataset from hand-scripted demonstrations
-    # For some tasks, call reset() again with a new seed if init state is 'done'.
-    while dataset.num_episodes < max_demos:
-        seed = dataset.num_episodes + seed_to_add
-        print(f'\nNEW DEMO: {dataset.num_episodes+1}/{max_demos}, seed {seed}\n')
-        np.random.seed(seed)
-        demo_reward, episode, t, last_obs_info = rollout(task.oracle(env), env, task, args)
-        last_extras = last_obs_info[1]['extras']
-
-        # Check if we should ignore or include this demo in the dataset.
-        if ignore_this_demo(args, demo_reward, t, last_extras):
-            seed_to_add += 1
-            print(f'ignore_this_demo=True, last_i: {last_extras}, re-sample seed: {seed_to_add}')
-        else:
-            dataset.add(episode, last_obs_info)
-            print(f'\ndemo reward: {demo_reward:0.5f}, len {t}, last_i: {last_extras}')
-
-    if make_new_env:
-        env.stop()
-        del env
-
-        if has_deformables(args.task):
-            print(f'Exiting due to task={args.task}, only generating demos.')
-            print(f'We cannot call Environment() multiple times (remotely).')
-            sys.exit()
+        state_dict = torch.load(ckpt_path, map_location='cuda')
+        nets = get_network()
+        ema_nets = nets
+        ema_nets.load_state_dict(state_dict["model_state_dict"])
+        print('Pretrained weights loaded.')
+    else:
+        print("Skipped pretrained weight loading.")
 
     # Evaluate on increasing orders of magnitude of demonstrations.
     num_train_runs = 3  # to measure variance over random initialization
@@ -283,8 +373,30 @@ if __name__ == '__main__':
     # Check if it's goal-conditioned.
     goal_conditioned = is_goal_conditioned(args)
 
+    # for this demo, we use DDPMScheduler with 100 diffusion iterations
+    num_diffusion_iters = 100
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        # the choise of beta schedule has big impact on performance
+        # we found squared cosine works the best
+        beta_schedule='squaredcos_cap_v2',
+        # clip output to [-1,1] to improve stability
+        clip_sample=True,
+        # our network predicts noise (instead of denoised action)
+        prediction_type='epsilon'
+    )
+
+    # device transfer
+    device = torch.device('cuda')
+    _ = nets.to(device)
+
+    # Dataset statistic
+    stats = {'action': {'min': np.array([ 0.2812497 , -0.46875015,  0.2575122 , -0.48762894], dtype=np.float32), 
+                    'max': np.array([0.71875143, 0.46875057, 0.74267364, 0.47370854], dtype=np.float32)}} # for cloth-cover
+
     # Do multiple training runs from scratch with TensorFlow random initialization.
     for train_run in range(num_train_runs):
+        print("train_run ", train_run)
 
         # Set up tensorboard logger.
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -324,39 +436,24 @@ if __name__ == '__main__':
         num_demos = int(args.num_demos)
 
         # Given `num_demos`, only sample up to that point, and not w/replacement.
+        max_demos = 5
+        num_demos = 5
         train_episodes = np.random.choice(range(max_demos), num_demos, False)
         dataset.set(train_episodes)
 
         performance = []
         while agent.total_iter < num_train_iters:
-            # Train agent.
-            tf.keras.backend.set_learning_phase(1)
-            agent.train(dataset, num_iter=test_interval, writer=train_summary_writer)
-            tf.keras.backend.set_learning_phase(0)
-
-            # agent.train() concludes with agent.save() inside it, then exit.
-            if args.save_zero:
-                print('We are now exiting due to args.save_zero...')
-                agent.total_iter = num_train_iters
-                continue
-
-            # Evaluate agent ONLY if non-deformables environment.
-            if has_deformables(args.task):
-                continue
-
-            # For now, until we get the evaluation working. I just want to see losses.
-            if 'transporter-goal' in args.agent or args.task == 'insertion-goal' or goal_conditioned:
-                continue
-
             # YD: test set
-            task.mode = 'test'
+            # task.mode = 'test'
             env = Environment(args.disp, hz=args.hz)
             for episode in range(num_test_episodes):
                 seed = 10**MAX_ORDER + episode
                 np.random.seed(seed)
-                total_reward, _, t, _ = rollout(agent, env, task, args)
+                total_reward, epi, t, _ = rollout(agent, env, stats, args)
+                # print("episode ", epi[1][1]) # default pick and place position - [0.5 , 0.  , 0.14]
                 print(f'Test (seed: {seed}): {episode} Total Reward: {total_reward:.2f}, len: {t}')
                 performance.append((agent.total_iter, total_reward))
+                print("  ")
             env.stop()
             del env
 

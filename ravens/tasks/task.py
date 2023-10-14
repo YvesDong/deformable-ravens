@@ -209,6 +209,7 @@ class Task():
                 overshoot = 0.03
                 act['params'] = self.params_no_rots(vertex_pos, target_pos, overshoot)
 
+            # YD: the 4-element tuple of pick and place action 
             elif isinstance(self, tasks.names['cloth-cover']):
                 # ------------------------------------------------------------ #
                 # Hopefully a straightforward one: put item on the center of
@@ -221,7 +222,7 @@ class Task():
                 assert len(self.block_IDs) == 1 # For now
 
                 # Get cloth mesh data and info about cloth/zone corners.
-                _, vert_pos_l = p.getMeshData(self.cloth_id, -1, flags=p.MESH_DATA_SIMULATION_MESH)
+                _, vert_pos_l = p.getMeshData(self.cloth_id, -1, flags=p.MESH_DATA_SIMULATION_MESH) # YD: in what coordinate frame?
                 corner_idx_np = np.array(self.corner_indices)
                 vertpos_xy_np = np.array(vert_pos_l)[:, :2]
                 cloth_center_xy = np.mean(vertpos_xy_np[corner_idx_np], axis=0)
@@ -253,8 +254,8 @@ class Task():
                     elif direction == 3:
                         source = corner_idx_np[3]
                         target = corner_idx_np[1]
-                    vertex_pos = vertpos_xy_np[source]
-                    target_pos = vertpos_xy_np[target]
+                    vertex_pos = vertpos_xy_np[source] # pick_xy
+                    target_pos = vertpos_xy_np[target] # place_xy
                     overshoot = 0.03
 
                 # We adjusted overshooting earlier based on the task stage.
