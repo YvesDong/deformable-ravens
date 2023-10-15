@@ -57,8 +57,13 @@ MAX_ORDER = 3
 
 def diffusion_inference(obs, stats, obs_horizon=1, action_horizon=1):
     """
-    Make a prediction of action based on the observation using a model trained by Diffusion Policy.
+    Make a 1-step prediction of action based on the observation using a model trained 
+    by Diffusion Policy.
     obs: list of 480*640*3
+    stats: dict, statistical summary of actions in the dataset.
+    Return:
+        pose0: tuple, pose of picking 
+        pose1: tuple, pose of placing 
     """
     # device transfer
     cond_image = torch.Tensor(obs)
@@ -396,8 +401,6 @@ if __name__ == '__main__':
 
     # Do multiple training runs from scratch with TensorFlow random initialization.
     for train_run in range(num_train_runs):
-        print("train_run ", train_run)
-
         # Set up tensorboard logger.
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         train_log_dir = os.path.join('logs', args.agent, args.task, current_time, 'train')
@@ -431,16 +434,6 @@ if __name__ == '__main__':
         else:
             agent = agents.names[args.agent](name, args.task)
 
-        # Limit random data sampling to fixed set.
-        np.random.seed(train_run)
-        num_demos = int(args.num_demos)
-
-        # Given `num_demos`, only sample up to that point, and not w/replacement.
-        max_demos = 5
-        num_demos = 5
-        train_episodes = np.random.choice(range(max_demos), num_demos, False)
-        dataset.set(train_episodes)
-
         performance = []
         while agent.total_iter < num_train_iters:
             # YD: test set
@@ -453,7 +446,7 @@ if __name__ == '__main__':
                 # print("episode ", epi[1][1]) # default pick and place position - [0.5 , 0.  , 0.14]
                 print(f'Test (seed: {seed}): {episode} Total Reward: {total_reward:.2f}, len: {t}')
                 performance.append((agent.total_iter, total_reward))
-                print("  ")
+                print(" ")
             env.stop()
             del env
 
