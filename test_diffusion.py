@@ -118,7 +118,8 @@ def diffusion_inference(obs, stats, obs_horizon=1, action_horizon=1):
     end = start + action_horizon
     action = action_pred[start:end,:].flatten() # numpy, (4,)
     ori = (0.0, 0.0, 0.0, 1.0) # quaternion of the grasp
-    z_val = 0.14
+    z_val = 0.001 # for cable-ring
+    z_val = 0.14 # for cloth-cover, TODO
     pose0 = (np.append(action[:2], z_val), ori) # pick
     pose1 = (np.append(action[2:], z_val), ori) # place
 
@@ -352,7 +353,8 @@ if __name__ == '__main__':
     # Set `load_pretrained = True` to load pretrained weights.
     load_pretrained = 1
     if load_pretrained:
-        ckpt_path = "/home/yif/Documents/KTH/git/DeformableDiffusion/sf24.ckpt"
+        # ckpt_path = "/home/yif/Documents/KTH/git/DeformableDiffusion/sf24.ckpt"
+        ckpt_path = "/home/yif/Documents/KTH/git/DeformableDiffusion/rb28.ckpt" # TODO
         if not os.path.isfile(ckpt_path):
             print('Path not found!')
 
@@ -396,8 +398,10 @@ if __name__ == '__main__':
     _ = nets.to(device)
 
     # Dataset statistic
-    stats = {'action': {'min': np.array([ 0.2812497 , -0.46875015,  0.2575122 , -0.48762894], dtype=np.float32), 
-                    'max': np.array([0.71875143, 0.46875057, 0.74267364, 0.47370854], dtype=np.float32)}} # for cloth-cover
+    # stats = {'action': {'min': np.array([ 0.2812497 , -0.46875015,  0.2575122 , -0.48762894], dtype=np.float32), 
+    #                 'max': np.array([0.71875143, 0.46875057, 0.74267364, 0.47370854], dtype=np.float32)}} # for cloth-cover, TODO
+    stats = {'action': {'min': np.array([ 0.1321154 , -0.5868091 ,  0.3375    , -0.40937498], dtype=np.float32),
+                    'max': np.array([0.90098524, 0.5565594 , 0.66249996, 0.4110589 ], dtype=np.float32)}} # for cable-ring
 
     # Do multiple training runs from scratch with TensorFlow random initialization.
     for train_run in range(num_train_runs):
